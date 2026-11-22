@@ -2,66 +2,19 @@
 
 import json
 from collections import defaultdict
+
 import networkx as nx
+
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import Community
+
 SUMMARY_WORD_LIMIT = 150
 
-
-def _failure_stats_by_model(graph: nx.DiGraph) -> dict[str, int]:
-    """Считает уникальные отчёты об отказах для каждой модели."""
-    result = {}
-
-    for model_id, data in graph.nodes(data=True):
-        if data.get("type") != "Model":
-            continue
-        reports = set()
-
-        for _, component_id, edge_data in graph.out_edges(model_id, data=True):
-            if (edge_data.get("type") != "FAILED" or graph.nodes[component_id].get("type") != "Component"):
-                continue
-            for chunk_id in edge_data.get("sources", []):
-                document_id = chunk_id.split("#", 1)[0]
-                if document_id.startswith("report_"):
-                    reports.add(document_id)
-        result[model_id] = len(reports)
-
-    return result
-
-def _failure_stats_by_product_line(graph: nx.DiGraph) -> dict:
-    """Считает уникальные отчёты об отказах компонентов для каждой линейки."""
-    models_by_line = defaultdict(set)
-
-    for source, target, data in graph.edges(data=True):
-        if (data.get("type") == "BELONGS_TO" and graph.nodes[source].get("type") == "Model"
-                and graph.nodes[target].get("type") == "ProductLine"):
-            models_by_line[target].add(source)
-
-    result = {}
-
-    for line_id, models in models_by_line.items():
-        reports_by_component = defaultdict(set)
-
-        for model_id in models:
-            for _, component_id, data in graph.out_edges(model_id, data=True):
-                if (data.get("type") != "FAILED" or graph.nodes[component_id].get("type") != "Component"):
-                    continue
-
-                for chunk_id in data.get("sources", []):
-                    document_id = chunk_id.split("#", 1)[0]
-                    if document_id.startswith("report_"):
-                        reports_by_component[component_id].add(document_id)
-
-        result[line_id] = {
-            graph.nodes[component_id].get("name", component_id): len(reports)
-            for component_id, reports in sorted(reports_by_component.items())
-        }
-
-    return result
-
-
 def detect_communities(graph: nx.DiGraph) -> list[Community]:
-    """Разбивает граф на сообщества алгоритмом Лувена."""
+    """Разбивает узлы на сообщества алгоритмом Лувена с фиксированным `seed`.
+
+    Каждый узел входит ровно в одно сообщество. Поле `summary` здесь остаётся пустым.
+    """
     if graph.number_of_nodes() == 0:
         return []
 
@@ -81,43 +34,11 @@ def detect_communities(graph: nx.DiGraph) -> list[Community]:
     normalized.sort(key=lambda nodes: nodes[0])
     return [Community(community_id=index, nodes=nodes) for index, nodes in enumerate(normalized)]
 
-
-def _build_failure_stats_text(community_failure_stats: dict, graph: nx.DiGraph,) -> str:
-    """Формирует текст статистики отказов из рассчитанных кодом значений."""
-    lines = []
-
-    for line_id, counts in sorted(community_failure_stats.items()):
-        if not counts:
-            continue
-
-        line_name = graph.nodes[line_id].get("name", line_id)
-        details = "; ".join(f"{component}: {count} отчётов"
-            for component, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        )
-
-        lines.append(f"Статистика отказов линейки {line_name}: {details}.")
-    return "\n".join(lines)
-
-
-def _limit_summary_words(summary: str, stats_text: str) -> str:
-    """Ограничивает сводку 150 словами, отдавая приоритет статистике."""
-    stats_words = stats_text.split()
-    summary_words = summary.split()
-
-    if len(stats_words) >= SUMMARY_WORD_LIMIT:
-        return " ".join(stats_words[:SUMMARY_WORD_LIMIT])
-
-    available_words = SUMMARY_WORD_LIMIT - len(stats_words)
-    summary_part = " ".join(summary_words[:available_words])
-
-    if summary_part and stats_text:
-        return f"{summary_part}\n{stats_text}"
-
-    return summary_part or stats_text
-
-
 def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient) -> str:
-    """Создаёт сводку сообщества на основе фактов графа и статистики."""
+    """Сводка сообщества не длиннее 150 слов: какие сущности входят, как связаны, что встречается чаще.
+
+    Все числа считает код по весам рёбер и передаёт модели готовыми. Модель их только формулирует.
+    """
     node_ids = set(community.nodes)
     failure_stats = _failure_stats_by_product_line(graph)
     community_failure_stats = {line_id: counts for line_id, counts in failure_stats.items() if line_id in node_ids}
@@ -230,3 +151,87 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
     summary = response.content.strip()
     stats_text = _build_failure_stats_text(community_failure_stats, graph)
     return _limit_summary_words(summary, stats_text)
+
+def _build_failure_stats_text(community_failure_stats: dict, graph: nx.DiGraph,) -> str:
+    """Формирует текст статистики отказов из рассчитанных кодом значений."""
+    lines = []
+
+    for line_id, counts in sorted(community_failure_stats.items()):
+        if not counts:
+            continue
+
+        line_name = graph.nodes[line_id].get("name", line_id)
+        details = "; ".join(f"{component}: {count} отчётов"
+            for component, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+
+        lines.append(f"Статистика отказов линейки {line_name}: {details}.")
+    return "\n".join(lines)
+
+
+def _limit_summary_words(summary: str, stats_text: str) -> str:
+    """Ограничивает сводку 150 словами, отдавая приоритет статистике."""
+    stats_words = stats_text.split()
+    summary_words = summary.split()
+
+    if len(stats_words) >= SUMMARY_WORD_LIMIT:
+        return " ".join(stats_words[:SUMMARY_WORD_LIMIT])
+
+    available_words = SUMMARY_WORD_LIMIT - len(stats_words)
+    summary_part = " ".join(summary_words[:available_words])
+
+    if summary_part and stats_text:
+        return f"{summary_part}\n{stats_text}"
+
+    return summary_part or stats_text
+
+def _failure_stats_by_model(graph: nx.DiGraph) -> dict[str, int]:
+    """Считает уникальные отчёты об отказах для каждой модели."""
+    result = {}
+
+    for model_id, data in graph.nodes(data=True):
+        if data.get("type") != "Model":
+            continue
+        reports = set()
+
+        for _, component_id, edge_data in graph.out_edges(model_id, data=True):
+            if (edge_data.get("type") != "FAILED" or graph.nodes[component_id].get("type") != "Component"):
+                continue
+            for chunk_id in edge_data.get("sources", []):
+                document_id = chunk_id.split("#", 1)[0]
+                if document_id.startswith("report_"):
+                    reports.add(document_id)
+        result[model_id] = len(reports)
+
+    return result
+
+def _failure_stats_by_product_line(graph: nx.DiGraph) -> dict:
+    """Считает уникальные отчёты об отказах компонентов для каждой линейки."""
+    models_by_line = defaultdict(set)
+
+    for source, target, data in graph.edges(data=True):
+        if (data.get("type") == "BELONGS_TO" and graph.nodes[source].get("type") == "Model"
+                and graph.nodes[target].get("type") == "ProductLine"):
+            models_by_line[target].add(source)
+
+    result = {}
+
+    for line_id, models in models_by_line.items():
+        reports_by_component = defaultdict(set)
+
+        for model_id in models:
+            for _, component_id, data in graph.out_edges(model_id, data=True):
+                if (data.get("type") != "FAILED" or graph.nodes[component_id].get("type") != "Component"):
+                    continue
+
+                for chunk_id in data.get("sources", []):
+                    document_id = chunk_id.split("#", 1)[0]
+                    if document_id.startswith("report_"):
+                        reports_by_component[component_id].add(document_id)
+
+        result[line_id] = {
+            graph.nodes[component_id].get("name", component_id): len(reports)
+            for component_id, reports in sorted(reports_by_component.items())
+        }
+
+    return result

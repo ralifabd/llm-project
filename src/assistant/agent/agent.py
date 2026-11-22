@@ -1,14 +1,16 @@
 """Цикл агента. Требования FR-7, FR-8, FR-9 и FR-10."""
 
+import re
 from collections.abc import Callable
 
-import re
 from assistant.agent.tools import TOOL_SCHEMAS
 from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
 PART_PATTERN = re.compile(r"\bP-\d{4}[A-Z]?\b", re.IGNORECASE)
+PRICE_KEYWORDS = re.compile(r"(стоит|цен[аы]|сколько.*руб|price)", re.IGNORECASE)
+ORDER_KEYWORDS = re.compile(r"(оформ|заказ|закажи|купи|покуп)", re.IGNORECASE)
 
 def run_agent(
     question: str,
@@ -68,7 +70,8 @@ def run_agent(
                 "- Для заказа сначала определи актуальную деталь через search_knowledge.\n"
                 "- В create_service_order передавай номер детали, а не код ошибки.\n"
                 "- Модель, склад и количество должны соответствовать запросу пользователя.\n"
-                "- Не создавай заказ без подтверждения пользователя.\n\n"
+                "- Не создавай заказ без подтверждения пользователя: вызывай create_service_order, "
+                "агент сам запросит подтверждение и вернёт номер детали в ответе.\n\n"
                 
                 "ОБЗОРНЫЕ ВОПРОСЫ:\n"
                 "- Для обзора темы используй summarize_topic.\n"
@@ -86,9 +89,13 @@ def run_agent(
     refused = False
     pending_action = None
     tool_calls_count = 0
+    get_price_called = False
+    order_confirmation_needed = False
 
     qty_match = re.search(r"\b(\d+)\s*(?:шт\.?|штук(?:и|у|а)?|единиц(?:ы|у)?)\b", question, re.IGNORECASE)
     user_qty = int(qty_match.group(1)) if qty_match else None
+    asks_price = bool(PRICE_KEYWORDS.search(question))
+    _ = bool(ORDER_KEYWORDS.search(question))
 
     while True:
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
@@ -99,7 +106,10 @@ def run_agent(
             break
 
         if tool_calls_count >= max_steps:
-            answer = response.content.strip() or ("Достигнут лимит вызовов инструментов. Не удалось завершить проверку.")
+            answer = (
+                response.content.strip()
+                or "Достигнут лимит вызовов инструментов. Не удалось завершить проверку."
+            )
             break
 
         for call in response.tool_calls:
@@ -120,14 +130,25 @@ def run_agent(
                 error = "Некорректные аргументы вызова инструмента."
 
             elif ("part_id" in args and args["part_id"] not in known_parts):
-                error = f"Номер детали {args['part_id']} не встречался в вопросе или результатах предыдущих инструментов."
+                error = (
+                    f"Номер детали {args['part_id']} не встречался в вопросе "
+                    f"или результатах предыдущих инструментов."
+                )
 
             elif name == "create_service_order":
                 if user_qty is None or args.get("qty") != user_qty:
                     error = "Количество не указано пользователем. Уточни количество."
                 elif not confirm:
                     pending_action = {"tool": name, "args": args}
+                    order_confirmation_needed = True
                     error = "Для создания заказа требуется подтверждение пользователя."
+                    step = ToolStep(tool=name, args=args, error=error)
+                    steps.append(step)
+                    messages.append(tool_message(call, {"error": error}))
+                    continue
+
+            if name == "get_price":
+                get_price_called = True
 
             if error is None:
                 key = (name, tuple(sorted(args.items())))
@@ -170,6 +191,25 @@ def run_agent(
         if tool_calls_count >= max_steps:
             continue
 
+        if asks_price and not get_price_called and known_parts:
+            part_id = next(iter(known_parts))
+            messages.append({
+                "role": "user",
+                "content": f"Деталь {part_id} найдена. Теперь вызови get_price для получения цены."
+            })
+            continue
+
+        if order_confirmation_needed and pending_action:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Заказ подготовлен, но требуется подтверждение пользователя. "
+                    "Объясни пользователю, что заказ готов к оформлению (номер детали, склад, количество, модель), "
+                    "и что для завершения нужно подтверждение. Не отказывай в ответе."
+                )
+            })
+            continue
+
     def is_grounded(text: str) -> bool:
         answer_parts = set(PART_PATTERN.findall(text))
         if not answer_parts.issubset(known_parts):
@@ -203,8 +243,17 @@ def run_agent(
         correction = llm.chat(messages, tools=TOOL_SCHEMAS)
         answer = correction.content.strip()
         if not answer or not is_grounded(answer):
-            answer = "Не могу дать достоверный ответ: данные не подтверждены."
-            refused = True
+            if order_confirmation_needed and pending_action:
+                answer = (
+                    f"Заказ готов к оформлению: деталь {pending_action['args']['part_id']}, "
+                    f"склад {pending_action['args']['warehouse']}, "
+                    f"количество {pending_action['args']['qty']}, "
+                    f"модель {pending_action['args']['model']}. "
+                    f"Для завершения оформления требуется ваше подтверждение."
+                )
+            else:
+                answer = "Не могу дать достоверный ответ: данные не подтверждены."
+                refused = True
 
     return AgentResult(
         answer=answer,

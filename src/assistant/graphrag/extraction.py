@@ -2,11 +2,19 @@
 
 import json
 import re
+
 from assistant.infra.config import vocabulary
 from assistant.infra.grounding import canonical_name, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import (ENTITY_TYPES, EXTRACTION_SCHEMA, RELATION_SIGNATURES, Chunk, Entity,
-                                     ExtractionResult, Relation)
+from assistant.infra.schemas import (
+    ENTITY_TYPES,
+    EXTRACTION_SCHEMA,
+    RELATION_SIGNATURES,
+    Chunk,
+    Entity,
+    ExtractionResult,
+    Relation,
+)
 
 SYSTEM = (
     "Ты извлекаешь сущности и связи из технических документов сервисной службы компании «ПолярТех».\n"
@@ -25,7 +33,8 @@ SYSTEM = (
     "ОСОБОЕ ПРАВИЛО ДЛЯ FIXED_BY:\n"
     "1. Если в документе сказано, что регламент или процедура применяется при определённой ошибке, извлекай FIXED_BY.\n"
     "2. Если сказано «Регламент SP-104 применяется при ошибке E-17», создай связь E-17 FIXED_BY SP-104.\n"
-    "3. Если процедура описывает устранение конкретной ошибки, связывай ErrorCode с этой Procedure отношением FIXED_BY.\n"
+    "3. Если процедура описывает устранение конкретной ошибки, связывай ErrorCode с этой "
+    "Procedure отношением FIXED_BY.\n"
     "4. Направление строгое: сначала ErrorCode, затем Procedure.\n"
     "5. Не создавай FIXED_BY, если связь ошибки с процедурой не подтверждается текстом.\n\n"
 

@@ -1,17 +1,15 @@
 """Инструменты агента. Требование FR-6."""
 
+import re
 from collections.abc import Callable
 
-import re
-
-from assistant.infra.erp_client import ErpClient,ErpNotFound,ErpRejected
+from assistant.graphrag.search import global_search, local_search
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
-from assistant.graphrag.search import global_search, local_search
 
 # Описания пяти инструментов в формате function calling:
 # search_knowledge, summarize_topic, check_stock, get_price, create_service_order.
-
 WAREHOUSES = ["Москва", "Санкт-Петербург", "Казань", "Новосибирск"]
 PART_ID_PATTERN = re.compile(r"P-\d{4}[A-Z]?")
 
